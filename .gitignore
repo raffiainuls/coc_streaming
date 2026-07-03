@@ -1,0 +1,15 @@
+# Kredensial — jangan pernah di-commit
+.env*
+!.env.example
+
+# Config connector (berisi kredensial) — dibagikan langsung ke audience, tidak di-push
+connectors/
+
+# Python & dbt
+venv/
+target/
+dbt_packages/
+logs/
+
+# macOS
+.DS_Store

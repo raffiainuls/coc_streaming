@@ -1,0 +1,180 @@
+# =============================================================================
+# Stack Data Streaming — Kelas CDC End-to-End
+#
+# MySQL (RDS, eksternal) -> Debezium (Kafka Connect) -> Kafka -> RisingWave
+#                                -> Kafka -> ClickHouse Sink (Kafka Connect) -> ClickHouse
+#
+# Yang TIDAK ada di sini: MySQL source (memakai RDS staging yang sudah ada,
+# diakses lewat VPN — kredensial di .env-staging).
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Kafka — message broker, mode KRaft (tanpa Zookeeper), single node.
+  # Dua listener:
+  #   - kafka:29092  -> dipakai antar-container (Kafka Connect, RisingWave, AKHQ)
+  #   - localhost:9092 -> dipakai dari laptop/host
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: PLAINTEXT://:29092,CONTROLLER://:29093,EXTERNAL://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # single node -> semua replication factor = 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:29092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # AKHQ — web UI untuk melihat topic, message, consumer group, dan status
+  # Kafka Connect. Buka di http://localhost:8080
+  # ---------------------------------------------------------------------------
+  akhq:
+    image: tchiotludo/akhq:0.25.0
+    container_name: akhq
+    ports:
+      - "8080:8080"
+    environment:
+      AKHQ_CONFIGURATION: |
+        akhq:
+          connections:
+            local:
+              properties:
+                bootstrap.servers: "kafka:29092"
+              connect:
+                - name: "kafka-connect"
+                  url: "http://kafka-connect:8083"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Kafka Connect — menjalankan connector Debezium (MySQL -> Kafka) dan
+  # ClickHouse Sink (Kafka -> ClickHouse).
+  # Saat pertama boot, plugin connector diunduh dulu dari Confluent Hub
+  # (butuh 2-5 menit + internet), baru worker-nya start.
+  # REST API di http://localhost:8083
+  # ---------------------------------------------------------------------------
+  kafka-connect:
+    image: confluentinc/cp-kafka-connect:7.6.1
+    container_name: kafka-connect
+    ports:
+      - "8083:8083"
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: kafka:29092
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: connect-cluster
+      CONNECT_CONFIG_STORAGE_TOPIC: _connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: _connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: _connect-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      # Event dikirim sebagai JSON polos (tanpa schema registry)
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components
+    command:
+      - bash
+      - -c
+      - |
+        echo "Menginstall connector plugins dari Confluent Hub..."
+        # Debezium di-pin ke 2.4.2: versi 3.x butuh Java 17,
+        # sedangkan image cp-kafka-connect 7.6.1 masih Java 11
+        confluent-hub install --no-prompt debezium/debezium-connector-mysql:2.4.2
+        confluent-hub install --no-prompt clickhouse/clickhouse-kafka-connect:latest
+        echo "Install selesai, menjalankan Kafka Connect worker..."
+        /etc/confluent/docker/run
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 120s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # RisingWave — streaming database (protokol PostgreSQL).
+  # Connect: psql -h localhost -p 4566 -d dev -U root
+  # Dashboard bawaan: http://localhost:5691
+  # ---------------------------------------------------------------------------
+  risingwave:
+    # catatan: tag v2.1.0 (yang dipakai repo acuan) sudah dihapus dari Docker Hub,
+    # v2.1.5 adalah patch release terakhir dari garis versi yang sama
+    image: risingwavelabs/risingwave:v2.1.5
+    container_name: risingwave
+    command: single_node
+    ports:
+      - "4566:4566"   # protokol PostgreSQL
+      - "5691:5691"   # dashboard web
+    volumes:
+      - risingwave-data:/root/.risingwave
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/4566' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # ClickHouse — database OLAP tujuan akhir.
+  # HTTP: http://localhost:8123 | native: localhost:9000
+  # User: default / clickhouse123, database awal: bronze_layer
+  # ---------------------------------------------------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: clickhouse
+    ports:
+      - "8123:8123"   # HTTP interface
+      - "9000:9000"   # native protocol
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: clickhouse123
+      CLICKHOUSE_DB: bronze_layer
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --password clickhouse123 --query 'SELECT 1'"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  kafka-data:
+  risingwave-data:
+  clickhouse-data:

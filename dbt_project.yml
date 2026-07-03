@@ -1,0 +1,22 @@
+name: 'coc_streaming'
+version: '1.0.0'
+profile: 'coc_streaming'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  coc_streaming:
+    # CREATE TABLE dengan connector kafka — membaca topic CDC dari Debezium
+    source:
+      +materialized: table_with_connector
+    # CREATE MATERIALIZED VIEW — transformasi streaming (macro custom, lihat macros/)
+    mv:
+      +materialized: risingwave_mv
+    # CREATE SINK — menulis hasil transformasi kembali ke Kafka
+    sink:
+      +materialized: sink

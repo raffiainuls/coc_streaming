@@ -1,0 +1,12 @@
+coc_streaming:
+  target: dev
+  outputs:
+    dev:
+      type: risingwave
+      host: '{{ env_var("RW_HOSTNAME") }}'
+      port: '{{ env_var("RW_PORT") | int }}'
+      user: '{{ env_var("RW_USER") }}'
+      password: '{{ env_var("RW_PASSWORD") }}'
+      dbname: '{{ env_var("RW_DB_NAME") }}'
+      schema: '{{ env_var("RW_SCHEMA") }}'
+      threads: 2
