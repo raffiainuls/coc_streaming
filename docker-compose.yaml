@@ -173,8 +173,38 @@ services:
       retries: 10
       start_period: 20s
     restart: unless-stopped
+      # ---------------------------------------------------------------------------
+  # MySQL — source lokal buat audience yang gak punya akses VPN ke RDS staging.
+  # Sudah dikonfigurasi CDC-ready (binlog ROW + full image) biar bisa langsung
+  # dipakai Debezium, sama kayak setelan RDS staging.
+  # ---------------------------------------------------------------------------
+  mysql:
+    image: mysql:8.0.40
+    container_name: mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: mysql123
+      MYSQL_DATABASE: coc_streaming
+    command:
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-pmysql123"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
 
 volumes:
   kafka-data:
   risingwave-data:
   clickhouse-data:
+  mysql-data:
